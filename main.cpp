@@ -29,6 +29,13 @@ ifstream inputFile;
 vector<int> rand_arr;
 int rand_ofs = 1;
 int latest_FT;
+int time_cpubusy;
+int time_iobusy;
+int blk_cnt = 0;
+int last_record_time = 0;
+bool show_quantum = false;
+bool preemptive = false;
+
 
 enum Transition {TRANS_TO_READY, TRANS_TO_RUN, TRANS_TO_BLOCK, TRANS_TO_PREEMPT, TRANS_TO_FINISHED};
 enum proc_state {CREATED, READY, RUNNING, BLOCKED, FINISHED};
@@ -36,7 +43,9 @@ const char *state_types[] = {"CREATED", "READY", "RUNNING", "BLOCKED", "FINISHED
 const char *trans_types[] = {"TRANS_TO_READY", "TRANS_TO_RUN", "TRANS_TO_BLOCK", "TRANS_TO_PREEMPT", "Done"};
 
 
-int myrandom(int burst) { return 1 + (rand_arr[(rand_ofs++) % rand_arr.size()] % burst); }
+int myrandom(int burst) { 
+    return 1 + (rand_arr[(rand_ofs++) % rand_arr.size()] % burst); 
+    }
 
 class Process {
     public:
@@ -68,6 +77,7 @@ class Process {
             this->TC = TC;
             this->CB = CB;
             this->IO = IO;
+            this->dynamic_prio = this->static_prio - 1;
             this->state = CREATED;
             this->remaining_CPU = TC; // zero means finished
             this->remaining_CPU_burst = 0;
@@ -104,13 +114,13 @@ class Event {
 };
 
 class DES {
-    vector<Event> event_queue;
+    list<Event> event_queue;
     public:
         Event* get_event() {
             if (event_queue.size() == 0) {
                 return NULL;
             }
-            Event *evt_ptr = &event_queue[0];
+            Event *evt_ptr = &(event_queue.front());
             return evt_ptr;
         }
 
@@ -119,9 +129,9 @@ class DES {
         }
 
         void put_event(Event e) {
-            for (int i = 0; i < event_queue.size(); i++) {
-                if (event_queue[i].Timestamp > e.Timestamp) {
-                    event_queue.insert(event_queue.begin() + i, e);
+            for (auto i = event_queue.begin(); i != event_queue.end(); i++) {
+                if ((*i).Timestamp > e.Timestamp) {
+                    event_queue.insert(i, e);
                     // std::cout << "inserted" << endl;
                     return;
                 }
@@ -137,6 +147,25 @@ class DES {
             
             return event_queue.front().Timestamp;
         }
+
+        bool delete_future_event(Process *proc_ptr, int time_stamp) {
+            for (auto i = event_queue.begin(); i != event_queue.end(); i++) {
+                if ((*i).Timestamp > time_stamp && (*i).proc->pid == proc_ptr->pid) {
+                    event_queue.erase(i);
+                    // std::cout << "future event deleted" << endl;
+                    return true;
+                }
+            }
+            // std::cout << "no event deleted" << endl;
+            return false;
+        }
+
+        void print_des() {
+            for (auto i = event_queue.begin(); i != event_queue.end(); i++) {
+                std::cout << "[Time: "<< (*i).Timestamp << ", id: " << (*i).proc->pid << ", Transition: " << trans_types[(*i).transition] << "]  ";
+            }
+            std::cout << endl;
+        }
         
 };
 
@@ -148,7 +177,7 @@ class Scheduler {
 };
 
 class FCFS: public Scheduler {
-    vector<Process*> run_queue;
+    list<Process*> run_queue;
     public: 
         void add_process(Process *proc) {
             run_queue.push_back(proc);
@@ -165,39 +194,177 @@ class FCFS: public Scheduler {
         }
 };
 
+class LCFS: public Scheduler {
+    list<Process*> run_queue;
+    public: 
+        void add_process(Process *proc) {
+            run_queue.push_back(proc);
+        }
+
+        Process* get_next_process() {
+            Process* proc_ptr;
+            if (run_queue.size() == 0) {
+                return NULL;
+            }
+            proc_ptr = run_queue.back();
+            run_queue.pop_back();
+            return proc_ptr;
+        }
+};
+
+class SRTF: public Scheduler {
+    list<Process*> run_queue;
+    public: 
+        void add_process(Process *proc) {
+            for (auto it = run_queue.begin(); it != run_queue.end(); it++) {
+                if (proc->remaining_CPU < (*it)->remaining_CPU) {
+                    run_queue.insert(it, proc);
+                    return;
+                }
+            }
+            run_queue.push_back(proc);
+        }
+
+
+        Process* get_next_process() {
+            Process* proc_ptr;
+            if (run_queue.size() == 0) {
+                return NULL;
+            }
+            proc_ptr = run_queue.front();
+            run_queue.pop_front();
+            return proc_ptr;
+        }
+};
+
+class RR: public Scheduler {
+    list<Process*> run_queue;
+    public: 
+        void add_process(Process *proc) {
+            run_queue.push_back(proc);
+        }
+
+        Process* get_next_process() {
+            Process* proc_ptr;
+            if (run_queue.size() == 0) {
+                return NULL;
+            }
+            proc_ptr = run_queue.front();
+            run_queue.erase(run_queue.begin());
+            return proc_ptr;
+        }
+};
+
+
+class PRIO: public Scheduler {
+    vector<list<Process*>> *activeQ;
+    vector<list<Process*>> *expiredQ;
+
+    vector<list<Process*>> q1;
+    vector<list<Process*>> q2;
+    public: 
+        PRIO() {
+            for (int i = 0; i < maxprio; i++) {
+                q1.push_back(list<Process*>());
+                q2.push_back(list<Process*>());
+            }
+            activeQ = &q1;
+            expiredQ = &q2;
+        }
+
+        bool activeQ_empty() {
+            for (int i = 0; i < activeQ->size(); i++) {
+                if (activeQ->at(i).size() != 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        
+        void add_process(Process *proc) {
+            if (proc->dynamic_prio == -1) {
+                
+                proc->dynamic_prio = proc->static_prio - 1;
+                expiredQ->at(proc->dynamic_prio).push_back(proc);
+            } else {
+                activeQ->at(proc->dynamic_prio).push_back(proc);
+            }
+        }
+
+        Process* get_next_process() {
+            Process* proc_ptr;
+            if (activeQ_empty()) {
+                std::swap(activeQ, expiredQ);
+                if (activeQ_empty()) {
+                    return NULL;
+                }
+            }
+
+            for (int i = activeQ->size() - 1; i >= 0; i--) {
+                if (activeQ->at(i).size() != 0) {
+                    proc_ptr = activeQ->at(i).front();
+                    activeQ->at(i).pop_front();
+                    break;
+                }
+            }
+            return proc_ptr;
+        }
+};
+
+
+void update_stats(bool is_running, int curr_time) {
+    if (is_running) {
+        time_cpubusy += (curr_time - last_record_time);
+    }
+    if (blk_cnt > 0) {
+        time_iobusy += (curr_time - last_record_time);
+    }
+    last_record_time = curr_time;
+}
+
 void simulation(DES des, Scheduler* scheduler_ptr) {
     Event* evt;
     Process *CURRENT_RUNNING_PROCESS = NULL;
+
+    
     while ((evt = des.get_event())) {
         Process *proc = evt->proc;
         int CURRENT_TIME = evt->Timestamp;
         int timeInPrevState = CURRENT_TIME - proc->state_ts;
         proc->state_ts = CURRENT_TIME;
         bool CALL_SCHEDULER = false;
-        // all transitions: {TRANS_TO_READY, TRANS_TO_RUN, TRANS_TO_BLOCK, TRANS_TO_PREEMPT};
-        // std::cout << trans_types[evt->transition] << endl;
-        // std::cout << "Current time: " << CURRENT_TIME << endl;
-        // std::cout << "Time in previous state: " << timeInPrevState << endl;
-        // proc->print_proc();
-        // std::cout << endl;
+
+
         if (v_flag) {
-            std::cout << CURRENT_TIME << " " << proc->pid << " " << timeInPrevState << ": " << trans_types[evt->transition] <<  endl;;
+            std::cout << CURRENT_TIME << " " << proc->pid << " " << timeInPrevState << ": " << trans_types[evt->transition] << endl;
         }
 
+        update_stats((CURRENT_RUNNING_PROCESS != NULL), CURRENT_TIME);
 
         switch(evt->transition) {
             case TRANS_TO_READY:
-                {
+                {   
                     CALL_SCHEDULER = true;
                     // add to run queue
+                    if (evt->oldstate == BLOCKED) {
+                        blk_cnt--;
+                        // When a process returns from I/O its dynamic priority is reset to (static_priority-1).
+                        proc->dynamic_prio = proc->static_prio - 1;
+                    }
+                    // check preemption event
+                    if (preemptive && CURRENT_RUNNING_PROCESS != NULL && evt->oldstate != RUNNING 
+                            && proc->dynamic_prio > CURRENT_RUNNING_PROCESS->dynamic_prio 
+                            && des.delete_future_event(CURRENT_RUNNING_PROCESS, CURRENT_TIME)) {
+
+                                Event running_to_preemp(CURRENT_TIME, CURRENT_RUNNING_PROCESS, RUNNING, READY, TRANS_TO_PREEMPT);
+                                des.put_event(running_to_preemp);
+
+                    } 
+                    
                     // will be called by scheduler in a later time
                     scheduler_ptr->add_process(proc);
                     // evt->newstate = READY;
-                    
-
-                    
-
-                    
                 }
                 break;
                 
@@ -205,12 +372,7 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
 
             case TRANS_TO_RUN:
                 {
-                    // evt->newstate = RUNNING;
-                    // running process assignment
                     CURRENT_RUNNING_PROCESS = proc;
-                    if (CURRENT_RUNNING_PROCESS == NULL) {
-                        std::cout << "buggy current running process" << endl;
-                    }
                     int burst_rest = CURRENT_RUNNING_PROCESS->remaining_CPU_burst;
                     // create event for either preemption or blocking for current running process
                     if (burst_rest <= 0) {
@@ -219,35 +381,26 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
                     }
 
                     burst_rest = std::min(burst_rest, proc->remaining_CPU);
-                    
                     proc->CW += timeInPrevState; // keep track of cpu waiting time
 
 
-                    // preemptive event created
-                    // quantum expiration
+
                     if (burst_rest > quantum) {
-                        proc->remaining_CPU -= quantum;
-                        proc->remaining_CPU_burst = burst_rest - quantum;
-                        proc->dynamic_prio = (proc->dynamic_prio < 0) ? (proc->static_prio - 1) : (proc->dynamic_prio - 1);
+                        proc->remaining_CPU_burst = burst_rest;
                         Event preempt_evt(CURRENT_TIME + quantum, proc, RUNNING, READY, TRANS_TO_PREEMPT);
                         des.put_event(preempt_evt);
                     }
                     // blocked event created
                     else if (proc->remaining_CPU > burst_rest) {
-                        proc->remaining_CPU -= burst_rest;
-                        proc->remaining_CPU_burst = 0;
-                        
+                        proc->remaining_CPU_burst = burst_rest;
                         Event block_evt(CURRENT_TIME + burst_rest, proc, RUNNING, BLOCKED, TRANS_TO_BLOCK);
                         burst_rest = 0;
                         des.put_event(block_evt);
                     } else { // proc->remaining_CPU == burst_rest
-                        // process finished
-                        proc->remaining_CPU = 0;
-                        proc->remaining_CPU_burst = 0;
+                        proc->remaining_CPU_burst = burst_rest;
                         Event finish_evt(CURRENT_TIME + burst_rest, proc, RUNNING, FINISHED, TRANS_TO_FINISHED);
                         des.put_event(finish_evt);
                     }
-
                     
                 }
                 break;
@@ -256,17 +409,18 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
 
             case TRANS_TO_BLOCK:
                 {
+                    blk_cnt++;
                     // evt->newstate = BLOCKED;
                     CALL_SCHEDULER = true;
                     CURRENT_RUNNING_PROCESS = NULL;
                     int io_burst = myrandom(proc->IO);
                     proc->IT += io_burst;
+                    proc->remaining_CPU -= timeInPrevState;
+                    proc->remaining_CPU_burst = 0;
                     // create event that transfer the process from blocked to ready
-                    // All: When a process returns from I/O its dynamic priority is reset to (static_priority-1).
-                    proc->dynamic_prio = proc->static_prio - 1;
+                    // // All: When a process returns from I/O its dynamic priority is reset to (static_priority-1).
                     Event rdy_evt(CURRENT_TIME + io_burst, proc, BLOCKED, READY, TRANS_TO_READY);
                     des.put_event(rdy_evt);
-                    
                     
                 }
                 break;
@@ -280,9 +434,12 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
                     // evt->newstate = PREEMPT;
                     CALL_SCHEDULER = true;
                     CURRENT_RUNNING_PROCESS = NULL;
+                    proc->remaining_CPU -= timeInPrevState;
+                    proc->remaining_CPU_burst -= timeInPrevState;
                     // add to runqueue (no event is generated)
+                    // std::cout << "preempt add process to ready started" << endl;
+                    proc->dynamic_prio = proc->dynamic_prio - 1;
                     scheduler_ptr->add_process(proc);
-                    
                 }
                 break;
 
@@ -294,13 +451,10 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
                     proc->FT = CURRENT_TIME;
                     proc->TT = CURRENT_TIME - proc->AT;
                     latest_FT = proc->FT; // keep track of the whole finish time
-                    
-                    
                 }
                 break;
         }
         des.rm_event();
-
 
         // schedule new events
         if (CALL_SCHEDULER) {
@@ -310,7 +464,6 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
                 continue; // process next event from Event queue for the same timestamp
             }
             CALL_SCHEDULER = false;
-            // std::cout << "nullptr condition check: " << (CURRENT_RUNNING_PROCESS == NULL) << endl;
             if (CURRENT_RUNNING_PROCESS == NULL) {
                 CURRENT_RUNNING_PROCESS = scheduler_ptr->get_next_process();
                 if (CURRENT_RUNNING_PROCESS == NULL) {
@@ -322,18 +475,8 @@ void simulation(DES des, Scheduler* scheduler_ptr) {
                 CURRENT_RUNNING_PROCESS = NULL;
             }
         }
-
-        
     }
 }
-
-
-
-
-
-
-
-
 
 
 
@@ -377,26 +520,38 @@ int main(int argc, char *argv[]) {
                     break;
                     
                     case 'L':
+                    scheduler_ptr = new LCFS();
                     sche_name = "LCFS";
                     break;
 
                     case 'S':
+                    scheduler_ptr = new SRTF();
                     sche_name = "SRTF";
                     break;
 
                     case 'R':
-                    sche_name = "Round";
                     sscanf(optarg, "%c%d", &first, &quantum);
+                    scheduler_ptr = new RR();
+                    sche_name = "RR";
+                    show_quantum = true;
+                    
                     break;
 
                     case 'P':
-                    sche_name = "PRIO";
                     sscanf(optarg, "%c%d:%d",&first, &quantum, &maxprio);
+                    scheduler_ptr = new PRIO();
+                    show_quantum = true;
+                    sche_name = "PRIO";
+                    
                     break;
 
                     case 'E':
-                    sche_name = "PREEMP";
                     sscanf(optarg, "%c%d:%d", &first, &quantum, &maxprio);
+                    sche_name = "PREPRIO";
+                    preemptive = true;
+                    scheduler_ptr = new PRIO();
+                    show_quantum = true;
+                    
                     break;
 
                     default: 
@@ -421,17 +576,8 @@ int main(int argc, char *argv[]) {
 
     const char *input_file_name = argv[optind];
     const char *rand_file_name = argv[optind+1];
-    // std::cout << v_flag << endl;
-    // std::cout << t_flag << endl;
-    // std::cout << e_flag << endl;
-    // std::cout << p_flag << endl;
-    std::cout << "scheduler name: " << sche_name << endl;
-    std::cout << "quantum: " << quantum << endl;
-    std::cout << "max priority: " << maxprio << endl;
-    std::cout << endl;
-    // std::cout << input_file_name << endl;
-    // std::cout << rand_file_name << endl;
 
+    
     randFile.open(rand_file_name);
     string word;
     while(randFile >> word) {
@@ -470,30 +616,33 @@ int main(int argc, char *argv[]) {
         des.put_event(e);
     }
 
-    // Event * current_event_ptr;
-    // count = 0;
-    // while ((current_event_ptr = des.get_event())) {
-    //     std::cout << "Time stamp: " << current_event_ptr->Timestamp << endl;
-    //     (current_event_ptr->proc)->print_proc();
-    //     std::cout << "old state: " << state_types[current_event_ptr->oldstate] << endl;
-    //     std::cout << "new state: " << state_types[current_event_ptr->newstate] << endl;
-    //     std::cout << endl;
-    //     des.rm_event();
-    // }
-
-    // std::cout << "DES Finished!" << endl;
 
     simulation(des, scheduler_ptr);
 
 
-    std::cout << sche_name << endl;
+    std::cout << sche_name;
+    if (show_quantum) {
+        std::cout << ' ' << quantum;
+    }
+    std::cout << endl;
     // print processes stats
+    int total_tt = 0;
+    int total_wait = 0;
     for (int i = 0; i < proc_arr.size(); i++) {
         proc_arr[i]->print_proc();
+        total_tt += proc_arr[i]->TT;
+        total_wait += proc_arr[i]->CW;
     }
     
-    // print summary 
+    double cpu_util = 100.0 * (time_cpubusy / (double) latest_FT);
+    double io_util = 100.0 * (time_iobusy / (double) latest_FT);
+    double throughput = 100.0 * (proc_arr.size() / (double) latest_FT);
+    double avg_tt = (((double) total_tt) / proc_arr.size());
+    double avg_cpu_wait = (((double) total_wait)/ proc_arr.size());
     
+
+    // print summary 
+    printf("SUM: %d %.2lf %.2lf %.2lf %.2lf %.3lf\n", latest_FT, cpu_util, io_util, avg_tt, avg_cpu_wait, throughput);
     
 
     return 0;
